@@ -7847,7 +7847,7 @@
     "id": "mortician",
     "name": "Mortician",
     "description": "Before the Cataclysm, you used to embalm and bury bodies. Nowadays, there is no more room in hell, so you're putting them down instead.",
-    "points": 0
+    "points": 0,
     "skills": [
       { "level": 1, "name": "swimming"},
       { "level": 1, "name": "firstaid"}
