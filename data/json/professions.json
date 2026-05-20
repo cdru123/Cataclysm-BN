@@ -7841,7 +7841,7 @@
       "male": [ "boxer_shorts" ],
       "female": [ "sports_bra", "boxer_shorts" ]
     }
-  }
+  },
   {
     "type": "profession",
     "id": "mortician",
@@ -7854,7 +7854,7 @@
     ],
     "items": {
       "both": {
-        "items" [
+        "items": [
           "suit",
           "socks",
           "dress_shoes",
