@@ -265,6 +265,23 @@ static void init_bubble_config()
     init_bubble_config( get_option<int>( "REALITY_BUBBLE_SIZE" ) );
 }
 
+static auto discard_monster_map_for_loaded_bubble( map &here,
+        const std::string &dimension_id ) -> void
+{
+    const auto origin = here.get_abs_sub();
+    const auto zmin = here.has_zlevels() ? -OVERMAP_DEPTH : origin.z();
+    const auto zmax = here.has_zlevels() ? OVERMAP_HEIGHT : origin.z();
+    const auto z_range = std::views::iota( zmin, zmax + 1 );
+    const auto xy_range = std::views::iota( 0, g_mapsize );
+    std::ranges::for_each(
+        cata::views::cartesian_product( z_range, xy_range, xy_range ),
+    [&]( auto tup ) {
+        const auto [gz, gx, gy] = tup;
+        get_overmapbuffer( dimension_id ).discard_monster_map(
+            tripoint_abs_sm{ origin.x() + gx, origin.y() + gy, gz } );
+    } );
+}
+
 static constexpr int DANGEROUS_PROXIMITY = 5;
 
 static const activity_id ACT_OPERATION( "ACT_OPERATION" );
@@ -665,7 +682,7 @@ void game::load_map( const tripoint_abs_sm &pos_sm, const bool pump_events )
     // flush prev_desired_ so update() does not evict freshly-generated submaps
     // for the new dimension (use-after-free via stale m.grid pointers).
     if( reality_bubble_handle_ != 0 && new_dim_id != old_dim_id ) {
-        // Drain any in-flight lazy-border tasks for the old dimension before
+        // Drain any in-flight submap load-manager tasks for the old dimension before
         // releasing handles and switching — workers must not race with the
         // new dimension's mapbuffer setup.
         submap_loader.drain_lazy_loads();
@@ -732,15 +749,13 @@ void game::load_map( const tripoint_abs_sm &pos_sm, const bool pump_events )
         submap_loader.update_request( reality_bubble_handle_, bubble_center );
     }
 
-    // Lazy border: 2-submap (one omt) strip kept in memory but not simulated.
-    // Pre-loaded from disk in the background so map shifts find data already
-    // resident.  Controlled by the LAZY_BORDER cached option.
+    // Lazy border: one OMT-space layer kept in memory but not simulated.
     if( lazy_border_enabled ) {
         if( lazy_border_handle_ == 0 ) {
             lazy_border_handle_ = submap_loader.request_load(
                                       load_request_source::lazy_border,
                                       new_dim_id, bubble_center,
-                                      reality_bubble_radius_ + 2 );
+                                      reality_bubble_radius_ );
         } else {
             submap_loader.update_request( lazy_border_handle_, bubble_center );
         }
@@ -2127,6 +2142,10 @@ bool game::do_turn()
     // Finally, clear pathfinding cache
     Pathfinding::clear_d_maps();
 
+    // Drain the OS input buffer so key-repeat events generated during world
+    // processing don't accumulate and drive movement after key release.
+    inp_mngr.pump_events();
+
     return false;
 }
 
@@ -3271,24 +3290,18 @@ bool game::load( const save_t &name )
     // setup() already called init_bubble_config() + m.resize().
     init_bubble_config();
     reality_bubble_radius_ = g_half_mapsize;
-    update_map( u );
-    // Discard stale monster_map entries for submaps inside the initial bubble.
-    // Old saves can have duplicates (same monster in critter_tracker and monster_map);
-    // discarding in-bubble entries prevents visible duplication on load.
-    {
-        const tripoint &origin = m.get_abs_sub().raw();
-        const auto zmin = m.has_zlevels() ? -OVERMAP_DEPTH : origin.z;
-        const auto zmax = m.has_zlevels() ? OVERMAP_HEIGHT : origin.z;
-        const auto z_range = std::views::iota( zmin, zmax + 1 );
-        const auto xy_range = std::views::iota( 0, g_mapsize );
-        std::ranges::for_each(
-            cata::views::cartesian_product( z_range, xy_range, xy_range ),
-        [&]( auto tup ) {
-            auto [gz, gx, gy] = tup;
-            get_overmapbuffer( current_dimension_id_ ).discard_monster_map(
-                tripoint_abs_sm{ origin.x + gx, origin.y + gy, gz } );
-        } );
+    // Old saves can have duplicate authority for in-bubble monsters: one copy in
+    // active_monsters and another in overmap monster_map.  Purge the stale overmap
+    // buckets before update_map() gets a chance to spawn newly-entered submaps.
+    discard_monster_map_for_loaded_bubble( m, current_dimension_id_ );
+    // Repair active monsters left outside every loaded submap by older broken saves.
+    for( auto &critter : all_monsters() ) {
+        if( m.get_submap_at( critter.bub_pos() ) == nullptr ) {
+            despawn_monster( critter );
+        }
     }
+    update_map( u );
+    discard_monster_map_for_loaded_bubble( m, current_dimension_id_ );
     m.build_floor_cache( get_levz() );
     for( auto &e : u.inv_dump() ) {
         e->set_owner( g->u );
@@ -3390,8 +3403,8 @@ bool game::save_artifacts()
 bool game::save_maps()
 {
     try {
-        // Drain any in-flight lazy-border preload tasks before save so that
-        // save_omt workers do not race with background workers calling add_submap().
+        // Drain any in-flight load-manager tasks before save so save_omt workers
+        // do not race with background workers calling add_submap().
         submap_loader.drain_lazy_loads();
         save_all_overmapbuffers(); // can throw — saves every loaded dimension's overmapbuffer
         // Save mapbuffers for all registered dimensions (active + any kept/non-active).
@@ -11883,10 +11896,10 @@ void game::place_player_overmap( const tripoint_abs_omt &om_dest )
         project_to<coords::sm>( om_dest ).raw() + point( -g_half_mapsize, -g_half_mapsize ) );
     const tripoint_bub_ms player_pos( u.bub_pos().xy(), map_sm_pos.z() );
     load_map( map_sm_pos );
-    m.spawn_monsters( true ); // Static monsters
     // update weather now as it could be different on the new location
     get_weather().nextweather = calendar::turn;
     place_player( player_pos );
+    m.spawn_monsters( true ); // Static monsters
     update_overmap_seen();
     // load_npcs() scans around the player's absolute position, updated by place_player().
     load_npcs();
@@ -12092,8 +12105,9 @@ bool game::grabbed_furn_move( const tripoint_rel_ms &dp )
     std::swap( *srcVars, *dstVars );
 
     // Actually move the furniture.
-    m.furn_set( fdest, m.furn( fpos ), atd ? atd->clone() : nullptr );
-    m.furn_set( fpos, f_null );
+    // Ignore grab destroy checks
+    m.furn_set( fdest, m.furn( fpos ), atd ? atd->clone() : nullptr, true );
+    m.furn_set( fpos, f_null, nullptr, true );
     u.clear_memorized_overlay( m.bub_to_abs( tripoint_bub_ms( fpos ) ) );
 
     if( fire_intensity == 1 && !pulling_furniture ) {
@@ -13853,7 +13867,7 @@ point_rel_sm game::update_map( int &x, int &y )
                 lazy_border_handle_ = submap_loader.request_load(
                                           load_request_source::lazy_border,
                                           m.get_bound_dimension(), new_center,
-                                          reality_bubble_radius_ + 2 );
+                                          reality_bubble_radius_ );
             } else {
                 submap_loader.update_request( lazy_border_handle_, new_center );
             }
